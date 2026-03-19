@@ -93,8 +93,8 @@ Also consider fixing deterministic backend options if exact repeatability is req
 
 ## License
 
-No license file is currently included. Add a license (for example MIT or Apache-2.0) before public release.
+To be released.
 
 ## Citation
 
-If you use this project in academic work, please cite your corresponding paper or technical report.
+To be released.
