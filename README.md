@@ -1,6 +1,6 @@
 # ParamNet
 
-ParamNet is a physics-informed neural model for estimating Brownian motion system parameters from short time windows.
+ParamNet is a Physics-Guided Deep Learning Framework for Parameters self-Inversion in Vacuum Optical Levitation System.
 
 The current training pipeline predicts:
 - Elastic constant: k
