@@ -10,7 +10,7 @@ The model combines:
 - A temporal branch (multi-scale residual 1D convolution + squeeze-and-excitation)
 - A frequency branch (FFT-derived features)
 - A heteroscedastic Gaussian objective (mean + variance prediction)
-- Physics-based regularization (AR(2) residual)
+- Physics-based regularization (AR(2) residual and ACF residual)
 
 ## Repository Structure
 
