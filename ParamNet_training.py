@@ -32,15 +32,25 @@ class TrainingConfig:
     log_interval: int = 10
     window_size: int = 200
     seq_overlap: int = 100
+
+    # overall scheduled physics coefficient
     physics_weight: float = 0.5
     physics_warmup_epochs: int = 30
+    physics_peak_epoch_ratio: float = 0.35
+    physics_min_ratio: float = 0.15
+
+    # inner weights of two physics-guided terms
+    ar_loss_weight: float = 1.0
+    acf_loss_weight: float = 0.5
+    acf_lag_pool: tuple = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+
     grad_accum_steps: int = 1
     lookahead_steps: int = 5
     lookahead_alpha: float = 0.5
     grad_clip: float = 1.0
     num_workers: int = 2
     include_pressure_aux: bool = True
-    # Std equivalent of multiplicative uniform pressure jitter U[-0.3, 0.3].
+
     pressure_window_jitter_rel: float = 0.1732
     pressure_window_jitter_abs: float = 0.0
     pressure_jitter_std: float = 0.0
@@ -49,8 +59,6 @@ class TrainingConfig:
     ts_noise_std: float = 0.01
     ts_gain_jitter: float = 0.10
     gamma_p_corr_weight: float = 0.08
-    physics_peak_epoch_ratio: float = 0.35
-    physics_min_ratio: float = 0.15
     
 class BrownianDataset(Dataset):
     def __init__(
@@ -503,20 +511,91 @@ def ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt):
     log_gamma = log_gamma.float().clamp(-20, 15)
     k = torch.pow(10.0, log_k)
     g = torch.pow(10.0, log_gamma)
-    m = mass
-    dt = dt.clamp_min(1e-12)
+    m = mass.float()
+    dt = dt.float().clamp_min(1e-12)
 
-    rho = torch.exp(-g * dt / (2.0 * m)).clamp(1e-6, 1-1e-6)
-    damp = g / (2.0*m)
-    omega2 = (k/m - damp**2).clamp(min=0.0)
+    rho = torch.exp(-g * dt / (2.0 * m)).clamp(1e-6, 1 - 1e-6)
+    damp = g / (2.0 * m)
+    omega2 = (k / m - damp**2).clamp(min=0.0)
     theta = torch.sqrt(omega2) * dt
-    theta = theta.clamp(1e-6, math.pi-1e-6)
+    theta = theta.clamp(1e-6, math.pi - 1e-6)
 
-    x = pos_raw - pos_raw.mean(dim=1, keepdim=True)
-    res = x[:,2:] - 2.0*rho[:,None]*torch.cos(theta)[:,None]*x[:,1:-1] + (rho**2)[:,None]*x[:,:-2]
+    x = pos_raw.float() - pos_raw.float().mean(dim=1, keepdim=True)
+    res = x[:, 2:] - 2.0 * rho[:, None] * torch.cos(theta)[:, None] * x[:, 1:-1] + (rho**2)[:, None] * x[:, :-2]
     energy = x.pow(2).mean(dim=1) + 1e-18
-    return (res.pow(2).mean(dim=1)/energy).mean()
+    return (res.pow(2).mean(dim=1) / energy).mean()
 
+
+def _resolve_acf_lags(window_len, lag_pool):
+    lags = [int(l) for l in lag_pool if 0 < int(l) < window_len]
+    return lags if len(lags) > 0 else [1]
+
+
+def acf_physics_loss(log_k, log_gamma, pos_raw, mass, dt, lag_pool=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32)):
+    """
+    L_ACF = mean_j (rho_emp(j) - rho_pred(j))^2
+    rho_pred follows the normalized underdamped Langevin ACF formula in the paper.
+    """
+    log_k = log_k.float().clamp(-20, 15)
+    log_gamma = log_gamma.float().clamp(-20, 15)
+    x = pos_raw.float()
+    m = mass.float()
+    dt = dt.float().clamp_min(1e-12)
+
+    k = torch.pow(10.0, log_k)
+    g = torch.pow(10.0, log_gamma)
+
+    x = x - x.mean(dim=1, keepdim=True)
+    var_x = x.pow(2).mean(dim=1) + 1e-18
+
+    damp = g / (2.0 * m)
+    omega2 = (k / m - damp**2).clamp(min=1e-16)
+    omega_d = torch.sqrt(omega2)
+
+    lags = _resolve_acf_lags(x.shape[1], lag_pool)
+
+    rho_emp_all = []
+    rho_pred_all = []
+
+    for lag in lags:
+        rho_emp = (x[:, :-lag] * x[:, lag:]).mean(dim=1) / var_x
+
+        tau = dt * float(lag)
+        exp_term = torch.exp(-damp * tau)
+        phase = omega_d * tau
+        ratio = damp / omega_d.clamp_min(1e-8)
+
+        rho_pred = exp_term * (torch.cos(phase) + ratio * torch.sin(phase))
+
+        rho_emp_all.append(rho_emp)
+        rho_pred_all.append(rho_pred)
+
+    rho_emp_all = torch.stack(rho_emp_all, dim=1)
+    rho_pred_all = torch.stack(rho_pred_all, dim=1)
+
+    return (rho_emp_all - rho_pred_all).pow(2).mean()
+
+
+def physics_loss_bundle(
+    log_k,
+    log_gamma,
+    pos_raw,
+    mass,
+    temp,
+    dt,
+    w_ar=1.0,
+    w_acf=0.5,
+    acf_lag_pool=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32),
+):
+    L_ar = ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt)
+    L_acf = acf_physics_loss(log_k, log_gamma, pos_raw, mass, dt, lag_pool=acf_lag_pool)
+
+    total = w_ar * L_ar + w_acf * L_acf
+    stats = {
+        "L_ar": float(L_ar.detach().cpu()),
+        "L_acf": float(L_acf.detach().cpu()),
+    }
+    return total, stats
 def physics_loss_bundle(log_k, log_gamma, pos_raw, mass, temp, dt, w_ar=1.0):
     L_ar = ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt)
     return w_ar * L_ar, (L_ar.item(),)
