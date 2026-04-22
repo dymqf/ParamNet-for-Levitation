@@ -651,9 +651,22 @@ class EMA:
     def apply_to(self, model):
         model.load_state_dict(self.shadow, strict=False)
 
-def train_epoch(model, loader, optimizer, device, physics_weight=0.0,
-                scaler=None, ema=None, grad_accum_steps=1, grad_clip=1.0,
-                lookahead=None, gamma_p_corr_weight=0.0):
+def train_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    physics_weight=0.0,
+    w_ar=1.0,
+    w_acf=0.5,
+    acf_lag_pool=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32),
+    scaler=None,
+    ema=None,
+    grad_accum_steps=1,
+    grad_clip=1.0,
+    lookahead=None,
+    gamma_p_corr_weight=0.0
+):
     model.train()
     total = 0.0
     valid_batches = 0
@@ -675,13 +688,25 @@ def train_epoch(model, loader, optimizer, device, physics_weight=0.0,
             loss_nll = nll_gauss_2d(log_k, log_g, s2k, s2g, tgt_logk, tgt_logg)
 
             loss_phys_value = 0.0
+            loss_ar_value = 0.0
+            loss_acf_value = 0.0
+
             if physics_weight > 0.0:
                 temp_lin = torch.pow(10.0, aux[:, 0])
-                loss_phys, _ = physics_loss_bundle(
-                    log_k, log_g, pos_raw, mass, temp_lin, dt,
-                    w_ar=1.0,
+                loss_phys, phys_stats = physics_loss_bundle(
+                    log_k,
+                    log_g,
+                    pos_raw,
+                    mass,
+                    temp_lin,
+                    dt,
+                    w_ar=w_ar,
+                    w_acf=w_acf,
+                    acf_lag_pool=acf_lag_pool,
                 )
                 loss_phys_value = float(loss_phys.detach().cpu())
+                loss_ar_value = phys_stats["L_ar"]
+                loss_acf_value = phys_stats["L_acf"]
                 loss = loss_nll + physics_weight * loss_phys
             else:
                 loss = loss_nll
@@ -731,7 +756,9 @@ def train_epoch(model, loader, optimizer, device, physics_weight=0.0,
                 "nll": f"{loss_nll.item():.4f}",
                 "loss": f"{loss.item():.4f}",
                 "loss_phys": f"{loss_phys_value:.4e}",
-                "loss_corr": f"{loss_corr_value:.4e}"
+                "loss_ar": f"{loss_ar_value:.4e}",
+                "loss_acf": f"{loss_acf_value:.4e}",
+                "loss_corr": f"{loss_corr_value:.4e}",
             })
         else:
             progress.set_postfix({
