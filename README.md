@@ -64,6 +64,8 @@ The script will:
 - Track validation loss and early stopping
 - Save best checkpoint to checkpoints/best_model.pth
 - Export loss and prediction plots under checkpoints/
+- checkpoint.zip
+https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu Password: kvmu 
 
 ## Core Training Features
 
