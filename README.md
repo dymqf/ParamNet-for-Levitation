@@ -103,8 +103,6 @@ The pretrained ParamNet checkpoint is provided through the GitHub Release page.
 
 - GitHub Release: `https://github.com/dymqf/ParamNet-for-Levitation/releases/tag/v1.0.0`
 - Release asset: `checkpoints.zip`
-- Baidu Netdisk mirror: `https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu`
-- Extraction code: `kvmu`
 
 After downloading `checkpoints.zip`, unzip it and place the checkpoint file as:
 
