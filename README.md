@@ -182,18 +182,6 @@ Please download `checkpoints.zip`, unzip it, and place the checkpoint file under
 checkpoints/best_model.pth
 ```
 
-For users in China, a Baidu Netdisk mirror is also provided:
-
-```bash
-https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu
-```
-
-Extraction code:
-
-```bash
-kvmu
-```
-
 The checkpoint can be loaded in Python as:
 
 ```python
