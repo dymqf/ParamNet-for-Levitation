@@ -33,7 +33,7 @@ The current training pipeline also includes:
 - EMA-based evaluation/checkpoint stabilization
 - notebook-based demo inference and visualization
 
-## Main Results Reported In The Paper
+## Main Results Reported in the Paper
 
 According to the manuscript, ParamNet achieves:
 
@@ -97,7 +97,33 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Train the model
+### 1. Download the pretrained checkpoint
+
+The pretrained ParamNet checkpoint is provided through the GitHub Release page.
+
+- GitHub Release: `https://github.com/dymqf/ParamNet-for-Levitation/releases/tag/v1.0.0`
+- Release asset: `checkpoints.zip`
+- Baidu Netdisk mirror: `https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu`
+- Extraction code: `kvmu`
+
+After downloading `checkpoints.zip`, unzip it and place the checkpoint file as:
+
+```bash
+checkpoints/best_model.pth
+```
+
+The expected directory structure is:
+
+```bash
+ParamNet-for-Levitation/
+├── ParamNet_training.py
+├── ParamNet_running.ipynb
+├── checkpoints/
+│   └── best_model.pth
+└── requirements.txt
+```
+
+### 2. Train the model
 
 ```bash
 python ParamNet_training.py
@@ -110,7 +136,7 @@ This script will:
 - save the best checkpoint to `checkpoints/best_model.pth`
 - export training and prediction figures to `checkpoints/`
 
-### 2. Run the notebook demo
+### 3. Run the notebook demo
 
 Open:
 
@@ -123,7 +149,7 @@ The notebook can be used to:
 - generate diagnostic figures for `kappa` and `gamma`
 - export prediction summaries to `.mat`
 
-### 3. Compare against traditional methods
+### 4. Compare against traditional methods
 
 Open:
 
@@ -144,14 +170,44 @@ The current physics-guided training setup in the main script uses:
 
 These settings reflect the current implementation used to align the repository with the manuscript description.
 
-## Checkpoint
+## Pretrained Checkpoint
 
-Pretrained checkpoint archive:
+The pretrained checkpoint is available from the GitHub Release page:
 
-- Baidu Netdisk: `https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu`
-- extraction code: `kvmu`
+```bash
+https://github.com/dymqf/ParamNet-for-Levitation/releases/tag/v1.0.0
+```
 
-## Scope And Limitations
+Please download `checkpoints.zip`, unzip it, and place the checkpoint file under:
+
+```bash
+checkpoints/best_model.pth
+```
+
+For users in China, a Baidu Netdisk mirror is also provided:
+
+```bash
+https://pan.baidu.com/s/1JC-Ow5_TYqADCJjunsgkQw?pwd=kvmu
+```
+
+Extraction code:
+
+```bash
+kvmu
+```
+
+The checkpoint can be loaded in Python as:
+
+```python
+import torch
+
+checkpoint_path = "checkpoints/best_model.pth"
+state_dict = torch.load(checkpoint_path, map_location="cpu")
+```
+
+In the demo notebook `ParamNet_running.ipynb`, the checkpoint is used for inference and visualization.
+
+## Scope and Limitations
 
 ParamNet is intended for parameter inversion in regimes reasonably close to the underdamped harmonic Langevin model used during simulation and training. As discussed in the paper, performance can degrade when there is strong model mismatch, for example:
 
