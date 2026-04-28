@@ -1,6 +1,6 @@
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -13,6 +13,14 @@ import copy
 
 from torch.nn.parameter import UninitializedParameter
 
+
+def _set_plot_font():
+    plt.rcParams.update({
+        'font.family': 'Times New Roman',
+        'font.serif': ['Times New Roman'],
+        'mathtext.fontset': 'stix',
+        'axes.unicode_minus': False,
+    })
 
 @dataclass
 class TrainingConfig:
@@ -31,8 +39,10 @@ class TrainingConfig:
     log_interval: int = 10
     window_size: int = 200
     seq_overlap: int = 100
-    physics_weight: float = 0.5
+    physics_weight: float = 1.12
     physics_warmup_epochs: int = 30
+    physics_w_ar: float = 1.76
+    physics_w_acf: float = 0.54
     grad_accum_steps: int = 1
     lookahead_steps: int = 5
     lookahead_alpha: float = 0.5
@@ -40,20 +50,15 @@ class TrainingConfig:
     num_workers: int = 2
     include_pressure_aux: bool = True
 
-    # Match the effective Gaussian intensity equivalent to P*(1+U[-0.3, 0.3])
-    # std(U[-a, a]) = a/sqrt(3) -> 0.3/sqrt(3) ~= 0.1732
+
     pressure_window_jitter_rel: float = 0.1732
     pressure_window_jitter_abs: float = 0.0
 
-    # Only use per-window Gaussian perturbation on pressure.
-    # Additional logP jitter / dropout / shuffle are disabled by default.
     pressure_jitter_std: float = 0.0
     pressure_dropout_prob: float = 0.0
     pressure_shuffle_prob: float = 0.0
-
     ts_noise_std: float = 0.01
     ts_gain_jitter: float = 0.10
-    gamma_p_corr_weight: float = 0.08
     physics_peak_epoch_ratio: float = 0.35
     physics_min_ratio: float = 0.15
 
@@ -85,9 +90,8 @@ class BrownianDataset(Dataset):
         self.ts_noise_std = float(max(0.0, ts_noise_std))
         self.ts_gain_jitter = float(max(0.0, ts_gain_jitter))
 
-        # Core fields
-        self.position_raw = data["position"].astype(np.float32)   # [B, T]
-        self.velocity_raw = data["velocity"].astype(np.float32) if "velocity" in data.files else None
+
+        self.position_raw = data["position"].astype(np.float32)
         self.k0_log = np.log10(data["k0"]).astype(np.float32)
         self.gamma_log = np.log10(data["gamma"]).astype(np.float32)
         self.D_lin = data["D"].astype(np.float32)
@@ -96,10 +100,7 @@ class BrownianDataset(Dataset):
         self.P_log = np.log10(np.clip(self.P, 1e-30, None)).astype(np.float32)
         self.m = data["m"].astype(np.float32)
         self.T = data["T"].astype(np.float32)
-
-        # Temperature jitter is a train-time augmentation and must not be applied in inference.
-        if self.is_train:
-            self.T = self.T + np.random.normal(0, 0.05, size=self.T.shape).astype(np.float32) * self.T
+        self.T = self.T + np.random.normal(0, 0.05, size=self.T.shape).astype(np.float32) * self.T
 
         fs_raw = data["fs"]
         if np.ndim(fs_raw) == 0:
@@ -113,45 +114,15 @@ class BrownianDataset(Dataset):
         self.windows_per_sample = max(1, (self.time_points - self.window_size) // self.stride + 1)
         self.total_windows = self.num_samples * self.windows_per_sample
 
-        # Optional reference normalization statistics.
-        # If present, use these stats instead of recomputing them from current samples.
-        # This allows exported short-window datasets to keep the same normalization as the source long trajectories.
-        ref_keys = ("pos_mu_ref", "pos_std_ref", "vel_mu_ref", "vel_std_ref")
-        self.has_ref_norm_stats = all(k in data.files for k in ref_keys)
-        if self.has_ref_norm_stats:
-            self.pos_mu_ref = np.asarray(data["pos_mu_ref"], dtype=np.float32).reshape(-1)
-            self.pos_std_ref = np.asarray(data["pos_std_ref"], dtype=np.float32).reshape(-1)
-            self.vel_mu_ref = np.asarray(data["vel_mu_ref"], dtype=np.float32).reshape(-1)
-            self.vel_std_ref = np.asarray(data["vel_std_ref"], dtype=np.float32).reshape(-1)
-            if (
-                self.pos_mu_ref.shape[0] != self.num_samples
-                or self.pos_std_ref.shape[0] != self.num_samples
-                or self.vel_mu_ref.shape[0] != self.num_samples
-                or self.vel_std_ref.shape[0] != self.num_samples
-            ):
-                raise ValueError(
-                    "Reference normalization stats length mismatch: expected length == num_samples."
-                )
 
-        # Normalize using whole-trajectory statistics so each window from the same sample shares identical statistics.
         self.position = np.empty_like(self.position_raw)
         self.velocity = np.empty_like(self.position_raw)
         for i in range(self.num_samples):
             dt = 1.0 / self.fs_values[i]
-            if self.velocity_raw is not None:
-                vel_raw = self.velocity_raw[i]
-            else:
-                vel_raw = np.gradient(self.position_raw[i], dt)
+            vel_raw = np.gradient(self.position_raw[i], dt)
 
-            if self.has_ref_norm_stats:
-                pos_mu = self.pos_mu_ref[i]
-                pos_std = self.pos_std_ref[i]
-                vel_mu = self.vel_mu_ref[i]
-                vel_std = self.vel_std_ref[i]
-            else:
-                pos_mu, pos_std = np.mean(self.position_raw[i]), np.std(self.position_raw[i])
-                vel_mu, vel_std = np.mean(vel_raw), np.std(vel_raw)
-
+            pos_mu, pos_std = np.mean(self.position_raw[i]), np.std(self.position_raw[i])
+            vel_mu, vel_std = np.meazn(vel_raw), np.std(vel_raw)
             pos_std = max(float(pos_std), 1e-8)
             vel_std = max(float(vel_std), 1e-8)
 
@@ -174,10 +145,7 @@ class BrownianDataset(Dataset):
         vel_norm = self.velocity[sample_idx, start:end]
         pos_raw = self.position_raw[sample_idx, start:end]
         dt = 1.0 / self.fs_values[sample_idx]
-        if self.velocity_raw is not None:
-            vel_raw = self.velocity_raw[sample_idx, start:end]
-        else:
-            vel_raw = np.gradient(pos_raw, dt)
+        vel_raw = np.gradient(pos_raw, dt)
 
         time_series = np.stack([pos_norm, vel_norm], axis=0).astype(np.float32)
 
@@ -189,6 +157,7 @@ class BrownianDataset(Dataset):
                 time_series = time_series + np.random.normal(
                     0.0, self.ts_noise_std, size=time_series.shape
                 ).astype(np.float32)
+
 
         p_log = np.float32(self.P_log[sample_idx])
         p_aux = np.float32(0.0)
@@ -209,7 +178,8 @@ class BrownianDataset(Dataset):
                 if np.random.rand() < self.pressure_dropout_prob:
                     p_aux = np.float32(0.0)
 
-        # [log10(T), log10(var(x_raw)), log10(m), log10(var(v_raw)), log10(dt), p_aux]
+
+
         aux_features = np.array([
             np.log10(self.T[sample_idx]),
             np.log10(np.clip(np.var(pos_raw), 1e-30, None)),
@@ -228,30 +198,17 @@ class BrownianDataset(Dataset):
             torch.from_numpy(pos_raw.astype(np.float32)),
             torch.tensor(self.m[sample_idx], dtype=torch.float32),
             torch.tensor(dt, dtype=torch.float32),
-            torch.tensor(p_log, dtype=torch.float32),
         )
-
-
 class DWConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k=5, s=1, d=1):
         super().__init__()
-        self.dw = nn.Conv1d(
-            in_ch,
-            in_ch,
-            kernel_size=k,
-            stride=s,
-            padding=(k // 2) * d,
-            dilation=d,
-            groups=in_ch,
-            bias=False,
-        )
+        self.dw = nn.Conv1d(in_ch, in_ch, kernel_size=k, stride=s, padding=(k//2)*d,
+                            dilation=d, groups=in_ch, bias=False)
         self.pw = nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm1d(out_ch)
         self.act = nn.SiLU()
-
     def forward(self, x):
         return self.act(self.bn(self.pw(self.dw(x))))
-
 
 class SE1D(nn.Module):
     def __init__(self, ch, r=8):
@@ -264,7 +221,6 @@ class SE1D(nn.Module):
             nn.Conv1d(h, ch, 1, bias=False),
             nn.Sigmoid()
         )
-
     def forward(self, x):
         w = self.fc(self.pool(x))
         return x * w
@@ -343,19 +299,18 @@ class CrossDomainAttention(nn.Module):
         f_refined = f_feat * self.f_gate(joint)
         return t_refined, f_refined
 
-
 class ParamNetV2(nn.Module):
     """
-    Parallel dual-branch network:
-      - time_branch: multi-scale residual stack + SE for long-range temporal correlations
-      - freq_branch: extended spectral statistics (magnitude/coherence/phase, etc.)
-    The fused representation outputs:
-      (mu_logk, mu_loggamma) and (logvar_logk, logvar_loggamma)
+    Two-branch parallel architecture:
+      - time_branch: multi-scale residual blocks with SE attention for long-range dependencies
+      - freq_branch: extended frequency-domain statistics, including magnitude, coherence, and phase features
+    The fused representation outputs (mu_logk, mu_loggamma) and
+    (logvar_logk, logvar_loggamma).
     """
-
     def __init__(self, window_size=200, aux_dim=6, hid=192, dropout=0.1, topK=60):
         super().__init__()
-        self.topK = min(topK, window_size // 2 + 1)
+
+        self.topK = min(int(topK), int(window_size) // 2 + 1)
 
         t_hidden = 128
         self.time_dim = t_hidden
@@ -388,9 +343,7 @@ class ParamNetV2(nn.Module):
             nn.SiLU()
         )
 
-        self.cross_attention = CrossDomainAttention(
-            self.time_dim, self.freq_dim, hidden=hid, dropout=dropout
-        )
+        self.cross_attention = CrossDomainAttention(self.time_dim, self.freq_dim, hidden=hid, dropout=dropout)
 
         self.head_pre = nn.Sequential(
             nn.Linear(self.time_dim + self.freq_dim + self.acf_dim + aux_dim, hid),
@@ -403,10 +356,20 @@ class ParamNetV2(nn.Module):
         self.mean_head = nn.Linear(hid, 2)
         self.logvar_head = nn.Linear(hid, 2)
 
+    @staticmethod
+    def _resample_lastdim(x, target_len):
+        """Linearly resample the last dimension to a fixed length."""
+        if x.shape[-1] == target_len:
+            return x
+        if x.dim() == 3:
+            return F.interpolate(x, size=target_len, mode='linear', align_corners=False)
+        if x.dim() == 2:
+            return F.interpolate(x.unsqueeze(1), size=target_len, mode='linear', align_corners=False).squeeze(1)
+        raise ValueError(f"Unsupported tensor rank for resample: {x.dim()}")
+
     def _freq_features(self, x):
         B, C, W = x.shape
         X = torch.fft.rfft(x, dim=-1)
-        X = X[..., :self.topK]
         mag = torch.abs(X).clamp_min(1e-16)
         pow_spec = mag ** 2
         freqs = torch.linspace(0, 0.5, X.shape[-1], device=x.device, dtype=x.dtype)
@@ -427,18 +390,15 @@ class ParamNetV2(nn.Module):
         phase_sin = torch.sin(phase).mean(dim=-1, keepdim=True)
         cross_power = cross_mag.mean(dim=-1, keepdim=True)
 
+
+        mag_k = self._resample_lastdim(mag, self.topK)
+        coherence_k = self._resample_lastdim(coherence, self.topK)
+
         feat = torch.cat([
-            mag.reshape(B, -1),
-            coherence.reshape(B, -1),
-            centroid,
-            peak_freq,
-            energy,
-            var,
-            coh_mean,
-            coh_max,
-            phase_cos,
-            phase_sin,
-            cross_power
+            mag_k.reshape(B, -1),
+            coherence_k.reshape(B, -1),
+            centroid, peak_freq, energy, var,
+            coh_mean, coh_max, phase_cos, phase_sin, cross_power
         ], dim=-1)
         return feat
 
@@ -469,38 +429,18 @@ class ParamNetV2(nn.Module):
     def forward(self, x, aux):
         t_encoded = self.t_encoder(x)
         tfeat = self.t_pool(t_encoded).squeeze(-1)
-
         ffeat_raw = self._freq_features(x)
         ffeat = self.f_fc(ffeat_raw)
-
         acf_raw = self._acf_features(x)
         acf_feat = self.acf_fc(acf_raw)
-
         tfeat, ffeat = self.cross_attention(tfeat, ffeat)
         fused = torch.cat([tfeat, ffeat, acf_feat, aux], dim=1)
         z = self.head_pre(fused)
-
         mean = self.mean_head(z)
         log_k, log_gamma = mean[:, 0], mean[:, 1]
-
         logvar = self.logvar_head(z).clamp(min=-8.0, max=4.0)
         s2_k, s2_g = torch.exp(logvar[:, 0]), torch.exp(logvar[:, 1])
-
         return log_k, log_gamma, s2_k, s2_g
-
-
-def _batch_corrcoef(x, y, eps=1e-8):
-    x = x.float().view(-1)
-    y = y.float().view(-1)
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = torch.sqrt((x.pow(2).mean() + eps) * (y.pow(2).mean() + eps))
-    return (x * y).mean() / denom
-
-
-def gamma_pressure_decorrelation_loss(log_gamma_pred, p_log):
-    corr = _batch_corrcoef(log_gamma_pred, p_log)
-    return corr.pow(2), corr.detach()
 
 
 class Lookahead:
@@ -560,7 +500,6 @@ class Lookahead:
             for dst, src in zip(self._slow_params, slow_params):
                 dst.copy_(src)
 
-
 def ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt):
     log_k = log_k.float().clamp(-20, 15)
     log_gamma = log_gamma.float().clamp(-20, 15)
@@ -569,64 +508,59 @@ def ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt):
     m = mass
     dt = dt.clamp_min(1e-12)
 
-    rho = torch.exp(-g * dt / (2.0 * m)).clamp(1e-6, 1 - 1e-6)
-    damp = g / (2.0 * m)
-    omega2 = (k / m - damp ** 2).clamp(min=0.0)
+    rho = torch.exp(-g * dt / (2.0 * m)).clamp(1e-6, 1-1e-6)
+    damp = g / (2.0*m)
+    omega2 = (k/m - damp**2).clamp(min=0.0)
     theta = torch.sqrt(omega2) * dt
-    theta = theta.clamp(1e-6, math.pi - 1e-6)
+    theta = theta.clamp(1e-6, math.pi-1e-6)
 
     x = pos_raw - pos_raw.mean(dim=1, keepdim=True)
-    res = (
-        x[:, 2:]
-        - 2.0 * rho[:, None] * torch.cos(theta)[:, None] * x[:, 1:-1]
-        + (rho ** 2)[:, None] * x[:, :-2]
-    )
+    res = x[:,2:] - 2.0*rho[:,None]*torch.cos(theta)[:,None]*x[:,1:-1] + (rho**2)[:,None]*x[:,:-2]
     energy = x.pow(2).mean(dim=1) + 1e-18
-    return (res.pow(2).mean(dim=1) / energy).mean()
-
+    return (res.pow(2).mean(dim=1)/energy).mean()
 
 def _empirical_acf(x, max_lag=40):
     """
-    x: [B, W]
-    Return normalized ACF [B, L], where L = min(max_lag, W-1).
+    x: [B, W]. Returns the normalized autocorrelation [B, L], where
+    L = min(max_lag, W - 1).
     """
     B, W = x.shape
     L = min(max_lag, W - 1)
     if L <= 0:
+
         return x.new_zeros(B, 0)
 
     x = x - x.mean(dim=1, keepdim=True)
     var = x.pow(2).mean(dim=1, keepdim=True) + 1e-18
     acf_list = []
     for l in range(1, L + 1):
+
         v = (x[:, :-l] * x[:, l:]).mean(dim=1, keepdim=True) / var
         acf_list.append(v)
     return torch.cat(acf_list, dim=1)
 
-
 def _theory_acf_underdamped(k, g, m, T, dt, max_lag=40):
     """
-    Return the normalized theoretical underdamped ACF [B, L].
+    Return the normalized theoretical ACF [B, L], where L is determined
+    by the window length and max_lag.
     """
     B = k.shape[0]
+
     dt = dt.view(-1, 1).clamp_min(1e-12)
+
 
     L = max_lag
     taus = torch.arange(1, L + 1, device=k.device, dtype=k.dtype).view(1, -1)
-    tau = taus * dt
+    τ = taus * dt
 
     w0 = torch.sqrt((k / m).clamp(1e-18))
     zeta = (g / (2 * m * w0)).clamp(1e-6, 0.999)
     wd = w0 * torch.sqrt(1 - zeta ** 2)
 
-    exp_term = torch.exp(-zeta.view(-1, 1) * w0.view(-1, 1) * tau)
+    exp_term = torch.exp(-zeta.view(-1,1) * w0.view(-1,1) * τ)
     coef = zeta / torch.sqrt(1 - zeta ** 2)
-    th = exp_term * (
-        torch.cos(wd.view(-1, 1) * tau)
-        + coef.view(-1, 1) * torch.sin(wd.view(-1, 1) * tau)
-    )
+    th = exp_term * (torch.cos(wd.view(-1,1) * τ) + coef.view(-1,1) * torch.sin(wd.view(-1,1) * τ))
     return th
-
 
 def acf_physics_loss(log_k, log_gamma, pos_raw, mass, temp, dt, max_lag=60, w_decay=0.98):
     log_k = log_k.float().clamp(-20, 15)
@@ -641,51 +575,50 @@ def acf_physics_loss(log_k, log_gamma, pos_raw, mass, temp, dt, max_lag=60, w_de
         return pos_raw.new_tensor(0.0)
 
     emp = _empirical_acf(pos_raw, max_lag=L)
-    th = _theory_acf_underdamped(k, g, m, temp, dt, max_lag=L)
+    th  = _theory_acf_underdamped(k, g, m, temp, dt, max_lag=L)
 
-    # Exponentially decaying weights: w[i] = w_decay^(i+1)
+
     w = (w_decay ** torch.arange(1, L + 1, device=emp.device, dtype=emp.dtype))
     w = w / (w.sum() + 1e-18)
 
-    diff = emp - th
+    diff = (emp - th)
     loss = (diff.pow(2) * w.view(1, -1)).sum(dim=1).mean()
     return loss
 
-
-def physics_loss_bundle(log_k, log_gamma, pos_raw, mass, temp, dt, w_ar=1.0, w_acf=1.0):
-    loss_ar = ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt)
-    loss_acf = acf_physics_loss(log_k, log_gamma, pos_raw, mass, temp, dt, max_lag=40)
-    return w_ar * loss_ar + w_acf * loss_acf, (loss_ar.item(), loss_acf.item())
-
-
+def physics_loss_bundle(log_k, log_gamma, pos_raw, mass, temp, dt,
+                        w_ar=1.76, w_acf=0.54):
+    L_ar  = ar2_physics_loss(log_k, log_gamma, pos_raw, mass, dt)
+    L_acf = acf_physics_loss(log_k, log_gamma, pos_raw, mass, temp, dt, max_lag=40)
+    return w_ar * L_ar + w_acf * L_acf
 def nll_gauss_2d(logk_pred, logg_pred, s2k, s2g, tgt_logk, tgt_logg):
-    # Cast to float32 to avoid overflow / NaN under AMP float16.
+
     logk_pred, logg_pred = logk_pred.float(), logg_pred.float()
     s2k, s2g = s2k.float(), s2g.float()
     tgt_logk, tgt_logg = tgt_logk.float(), tgt_logg.float()
 
-    term_k = 0.5 * (torch.log(s2k + 1e-18) + (logk_pred - tgt_logk).pow(2) / (s2k + 1e-18))
-    term_g = 0.5 * (torch.log(s2g + 1e-18) + (logg_pred - tgt_logg).pow(2) / (s2g + 1e-18))
-    return (term_k + term_g).mean()
 
+    term_k = 0.5*(torch.log(s2k + 1e-18) + (logk_pred - tgt_logk).pow(2)/(s2k + 1e-18))
+    term_g = 0.5*(torch.log(s2g + 1e-18) + (logg_pred - tgt_logg).pow(2)/(s2g + 1e-18))
+    return (term_k + term_g).mean()
 
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {}
 
-        # Only apply EMA to floating-point tensors. Clone all others directly.
         for k, v in model.state_dict().items():
             if isinstance(v, UninitializedParameter):
-                # Lazy parameters will be initialized after the first forward pass.
+
                 continue
             if torch.is_floating_point(v):
                 self.shadow[k] = v.detach().clone()
             else:
+
                 self.shadow[k] = v.clone()
 
     @torch.no_grad()
     def _ensure_init(self, model):
+
         for k, v in model.state_dict().items():
             if k not in self.shadow:
                 if isinstance(v, UninitializedParameter):
@@ -697,12 +630,15 @@ class EMA:
         self._ensure_init(model)
         for k, v in model.state_dict().items():
             if k not in self.shadow:
+
                 self.shadow[k] = v.detach().clone() if torch.is_floating_point(v) else v.clone()
                 continue
 
             if torch.is_floating_point(v):
+
                 self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
             else:
+
                 if self.shadow[k].dtype != v.dtype or self.shadow[k].shape != v.shape:
                     self.shadow[k] = v.clone()
                 else:
@@ -710,22 +646,12 @@ class EMA:
 
     @torch.no_grad()
     def apply_to(self, model):
+
         model.load_state_dict(self.shadow, strict=False)
 
-
-def train_epoch(
-    model,
-    loader,
-    optimizer,
-    device,
-    physics_weight=0.0,
-    scaler=None,
-    ema=None,
-    grad_accum_steps=1,
-    grad_clip=1.0,
-    lookahead=None,
-    gamma_p_corr_weight=0.0,
-):
+def train_epoch(model, loader, optimizer, device, physics_weight=0.0,
+                scaler=None, ema=None, grad_accum_steps=1, grad_clip=1.0,
+                lookahead=None, physics_w_ar=1.76, physics_w_acf=0.54):
     model.train()
     total = 0.0
     valid_batches = 0
@@ -733,12 +659,10 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
     grad_accum_steps = max(1, grad_accum_steps)
     has_valid_grad = False
-
     for step, batch in enumerate(progress):
-        time_series, aux, targets, pos_raw, mass, dt, p_log = batch
+        time_series, aux, targets, pos_raw, mass, dt = batch
         time_series, aux, targets = time_series.to(device), aux.to(device), targets.to(device)
         pos_raw, mass, dt = pos_raw.to(device), mass.to(device), dt.to(device)
-        p_log = p_log.to(device)
 
         tgt_logk, tgt_logg = targets[:, 0], targets[:, 1]
 
@@ -750,26 +674,14 @@ def train_epoch(
             loss_phys_value = 0.0
             if physics_weight > 0.0:
                 temp_lin = torch.pow(10.0, aux[:, 0])
-                loss_phys, parts = physics_loss_bundle(
-                    log_k,
-                    log_g,
-                    pos_raw,
-                    mass,
-                    temp_lin,
-                    dt,
-                    w_ar=1.0,
-                    w_acf=1.0,
+                loss_phys = physics_loss_bundle(
+                    log_k, log_g, pos_raw, mass, temp_lin, dt,
+                    w_ar=physics_w_ar, w_acf=physics_w_acf
                 )
                 loss_phys_value = float(loss_phys.detach().cpu())
                 loss = loss_nll + physics_weight * loss_phys
             else:
                 loss = loss_nll
-
-            loss_corr_value = 0.0
-            if gamma_p_corr_weight > 0.0:
-                loss_corr, corr_now = gamma_pressure_decorrelation_loss(log_g, p_log)
-                loss_corr_value = float(loss_corr.detach().cpu())
-                loss = loss + gamma_p_corr_weight * loss_corr
 
         if torch.isfinite(loss):
             loss_scaled = loss / grad_accum_steps
@@ -810,75 +722,56 @@ def train_epoch(
                 "nll": f"{loss_nll.item():.4f}",
                 "loss": f"{loss.item():.4f}",
                 "loss_phys": f"{loss_phys_value:.4e}",
-                "loss_corr": f"{loss_corr_value:.4e}",
             })
         else:
             progress.set_postfix({
                 "nll": "NaN",
                 "loss": "NaN",
                 "loss_phys": "NaN",
-                "loss_corr": "NaN",
             })
 
     return total / max(1, valid_batches)
 
-
 @torch.no_grad()
-def validate(model, loader, device, physics_weight=0.0, gamma_p_corr_weight=0.0):
+def validate(model, loader, device, physics_weight=0.0,
+             physics_w_ar=1.76, physics_w_acf=0.54):
     model.eval()
     total = 0.0
     k_errs, g_errs = [], []
-    corr_values = []
-
     for batch in loader:
-        time_series, aux, targets, pos_raw, mass, dt, p_log = batch
+        time_series, aux, targets, pos_raw, mass, dt = batch
         time_series, aux, targets = time_series.to(device), aux.to(device), targets.to(device)
         pos_raw, mass, dt = pos_raw.to(device), mass.to(device), dt.to(device)
-        p_log = p_log.to(device)
 
-        tgt_logk, tgt_logg = targets[:, 0], targets[:, 1]
+        tgt_logk, tgt_logg = targets[:,0], targets[:,1]
         log_k, log_g, s2k, s2g = model(time_series, aux)
         loss_nll = nll_gauss_2d(log_k, log_g, s2k, s2g, tgt_logk, tgt_logg)
 
         if physics_weight > 0.0:
-            temp_lin = torch.pow(10.0, aux[:, 0])
-            loss_phys, parts = physics_loss_bundle(
-                log_k,
-                log_g,
-                pos_raw,
-                mass,
-                temp_lin,
-                dt,
-                w_ar=1.0,
-                w_acf=1.0,
-            )
+            temp_lin = torch.pow(10.0, aux[:,0])
+            loss_phys = physics_loss_bundle(log_k, log_g, pos_raw, mass, temp_lin, dt,
+                                            w_ar=physics_w_ar, w_acf=physics_w_acf)
             loss = loss_nll + physics_weight * loss_phys
         else:
             loss = loss_nll
 
-        if gamma_p_corr_weight > 0.0:
-            loss_corr, corr_now = gamma_pressure_decorrelation_loss(log_g, p_log)
-            loss = loss + gamma_p_corr_weight * loss_corr
-            corr_values.append(float(torch.abs(corr_now).detach().cpu()))
-
         total += loss.item()
 
-        k_rel = (torch.abs(10 ** log_k - 10 ** tgt_logk) / (10 ** tgt_logk)).detach().cpu().numpy()
-        g_rel = (torch.abs(10 ** log_g - 10 ** tgt_logg) / (10 ** tgt_logg)).detach().cpu().numpy()
-        k_errs.append(k_rel)
-        g_errs.append(g_rel)
+        k_rel = (torch.abs(10**log_k - 10**tgt_logk) / (10**tgt_logk)).detach().cpu().numpy()
+        g_rel = (torch.abs(10**log_g - 10**tgt_logg) / (10**tgt_logg)).detach().cpu().numpy()
+        k_errs.append(k_rel); g_errs.append(g_rel)
 
-    corr_mean = float(np.mean(corr_values)) if len(corr_values) > 0 else 0.0
-    return total / len(loader), np.concatenate(k_errs).mean(), np.concatenate(g_errs).mean(), corr_mean
-
+    return total/len(loader), np.concatenate(k_errs).mean(), np.concatenate(g_errs).mean()
 
 def train_model(config):
+
     print(f"Using device: {config.device}")
     worker_count = max(0, config.num_workers)
     val_worker_count = max(0, config.num_workers // 2) if config.num_workers > 1 else worker_count
 
     if not os.path.exists(config.save_dir):
         os.makedirs(config.save_dir)
+
 
     train_dataset = BrownianDataset(
         config.train_file,
@@ -908,7 +801,7 @@ def train_model(config):
         shuffle=True,
         num_workers=worker_count,
         pin_memory=(config.device == 'cuda'),
-        persistent_workers=worker_count > 0,
+        persistent_workers=worker_count > 0
     )
 
     val_loader = DataLoader(
@@ -917,39 +810,22 @@ def train_model(config):
         shuffle=False,
         num_workers=val_worker_count,
         pin_memory=(config.device == 'cuda'),
-        persistent_workers=val_worker_count > 0,
+        persistent_workers=val_worker_count > 0
     )
 
-    model = ParamNetV2(
-        window_size=config.window_size,
-        aux_dim=6,
-        hid=config.hidden_dim,
-        dropout=config.dropout,
-    ).to(config.device)
+    model = ParamNetV2(window_size=config.window_size, aux_dim=6,
+                   hid=config.hidden_dim, dropout=config.dropout).to(config.device)
 
-    base_optimizer = optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
-    lookahead = (
-        Lookahead(base_optimizer, alpha=config.lookahead_alpha, k=config.lookahead_steps)
-        if config.lookahead_steps > 0 else None
-    )
+    base_optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    lookahead = Lookahead(base_optimizer, alpha=config.lookahead_alpha, k=config.lookahead_steps) if config.lookahead_steps > 0 else None
 
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        base_optimizer, T_0=10, T_mult=2, eta_min=1e-6
-    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(base_optimizer, T_0=10, T_mult=2, eta_min=1e-6)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(config.device == 'cuda'))
     ema = EMA(model, decay=0.999)
-
-    best_val = float('inf')
-    patience_counter = 0
-    train_losses = []
-    val_losses = []
-
+    best_val = float('inf'); patience_counter = 0; train_losses = []; val_losses = []
     for epoch in range(1, config.epochs + 1):
         print(f"\n=== Epoch {epoch}/{config.epochs} ===")
-
         if config.physics_warmup_epochs <= 0:
             peak_epoch = max(1, int(config.epochs * config.physics_peak_epoch_ratio))
             if epoch <= peak_epoch:
@@ -957,24 +833,13 @@ def train_model(config):
                 phys_w = 0.5 * config.physics_weight * (1.0 - math.cos(math.pi * up))
             else:
                 down = (epoch - peak_epoch) / max(1, config.epochs - peak_epoch)
-                tail = config.physics_min_ratio + (1.0 - config.physics_min_ratio) * 0.5 * (
-                    1.0 + math.cos(math.pi * down)
-                )
+                tail = config.physics_min_ratio + (1.0 - config.physics_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * down))
                 phys_w = config.physics_weight * tail
         else:
             warm_progress = min(1.0, epoch / max(1, config.physics_warmup_epochs))
             warm_w = 0.5 * config.physics_weight * (1.0 - math.cos(math.pi * warm_progress))
-            decay_progress = min(
-                1.0,
-                max(
-                    0.0,
-                    (epoch - config.physics_warmup_epochs)
-                    / max(1, config.epochs - config.physics_warmup_epochs),
-                ),
-            )
-            decay_tail = config.physics_min_ratio + (1.0 - config.physics_min_ratio) * 0.5 * (
-                1.0 + math.cos(math.pi * decay_progress)
-            )
+            decay_progress = min(1.0, max(0.0, (epoch - config.physics_warmup_epochs) / max(1, config.epochs - config.physics_warmup_epochs)))
+            decay_tail = config.physics_min_ratio + (1.0 - config.physics_min_ratio) * 0.5 * (1.0 + math.cos(math.pi * decay_progress))
             phys_w = min(warm_w, config.physics_weight * decay_tail)
 
         tr = train_epoch(
@@ -988,7 +853,8 @@ def train_model(config):
             grad_accum_steps=config.grad_accum_steps,
             grad_clip=config.grad_clip,
             lookahead=lookahead,
-            gamma_p_corr_weight=config.gamma_p_corr_weight,
+            physics_w_ar=config.physics_w_ar,
+            physics_w_acf=config.physics_w_acf,
         )
 
         ema_backup = None
@@ -996,52 +862,46 @@ def train_model(config):
             ema_backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
             ema.apply_to(model)
 
-        va, k_err, g_err, gp_corr = validate(
+        va, k_err, g_err = validate(
             model,
             val_loader,
             config.device,
             physics_weight=phys_w,
-            gamma_p_corr_weight=config.gamma_p_corr_weight,
+            physics_w_ar=config.physics_w_ar,
+            physics_w_acf=config.physics_w_acf,
         )
 
-        train_losses.append(tr)
-        val_losses.append(va)
+        train_losses.append(tr); val_losses.append(va)
         scheduler.step(epoch)
-
         print(
-            f"Train: {tr:.6f} | Val: {va:.6f} | phys_w: {phys_w:.3f} | "
-            f"k: {k_err * 100:.2f}% gamma: {g_err * 100:.2f}% | "
-            f"|corr(loggamma, logP)|: {gp_corr:.3f}"
+            f"Train: {tr:.6f} | Val: {va:.6f} | phys_w:{phys_w:.3f} | "
+            f"k:{k_err*100:.2f}% γ:{g_err*100:.2f}%"
         )
 
         if va < best_val:
-            best_val = va
-            patience_counter = 0
-            torch.save(
-                {
-                    'epoch': epoch,
-                    'model_state_dict': copy.deepcopy(model.state_dict()),
-                    'optimizer_state_dict': base_optimizer.state_dict(),
-                    'val_loss': va,
-                    'k_error': k_err,
-                    'gamma_error': g_err,
-                    'gamma_pressure_abs_corr': gp_corr,
-                    'ema_state_dict': copy.deepcopy(ema.shadow) if ema is not None else None,
-                    'lookahead_state_dict': lookahead.state_dict() if lookahead is not None else None,
-                    'scheduler_state_dict': scheduler.state_dict(),
-                },
-                f"{config.save_dir}/best_model.pth",
-            )
-            print("Model checkpoint saved (EMA weights).")
+            best_val = va; patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': copy.deepcopy(model.state_dict()),
+                'optimizer_state_dict': base_optimizer.state_dict(),
+                'val_loss': va,
+                'k_error': k_err,
+                'gamma_error': g_err,
+                'ema_state_dict': copy.deepcopy(ema.shadow) if ema is not None else None,
+                'lookahead_state_dict': lookahead.state_dict() if lookahead is not None else None,
+                'scheduler_state_dict': scheduler.state_dict()
+            }, f"{config.save_dir}/best_model.pth")
+            print("Saved model with EMA weights.")
         else:
             patience_counter += 1
             if patience_counter >= config.patience:
-                print(f"Early stopping: no improvement for {config.patience} epochs.")
-                break
+                print(f"Early stopping: no improvement for {config.patience} epochs."); break
 
         if ema_backup is not None:
             model.load_state_dict(ema_backup, strict=False)
 
+
+    _set_plot_font()
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -1053,6 +913,7 @@ def train_model(config):
     plt.savefig(f"{config.save_dir}/loss_curve.png")
     plt.show()
 
+
     checkpoint = torch.load(f"{config.save_dir}/best_model.pth", weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -1061,39 +922,49 @@ def train_model(config):
 
 def predict(model, loader, device):
     """
-    Run model inference.
+    Run inference with the trained model.
 
     Args:
-        model: Trained model
-        loader: DataLoader
-        device: CPU or GPU device
+        model: Trained model.
+        loader: Data loader.
+        device: Target device (CPU or GPU).
 
     Returns:
-        Dictionary containing predictions and targets.
+        Predicted values and ground-truth values.
     """
     model.eval()
     k_pred, g_pred = [], []
     k_true, g_true = [], []
 
     with torch.no_grad():
-        for time_series, aux, targets, _, _, _, _ in tqdm(loader, desc="Predicting"):
+        for time_series, aux, targets, _, _, _ in tqdm(loader, desc="Predicting"):
+
             time_series = time_series.to(device)
             aux = aux.to(device)
 
+
             k_t, g_t = targets[:, 0], targets[:, 1]
-            log_k, log_g, _, _ = model(time_series, aux)
 
-            k_pred.extend(10 ** log_k.cpu().numpy())
-            g_pred.extend(10 ** log_g.cpu().numpy())
 
-            k_true.extend(10 ** k_t.numpy())
-            g_true.extend(10 ** g_t.numpy())
+            log_k, log_g,_,_ = model(time_series, aux)
+
+
+            k_pred.extend(10**log_k.cpu().numpy())
+            g_pred.extend(10**log_g.cpu().numpy())
+
+
+            k_true.extend(10**k_t.numpy())
+            g_true.extend(10**g_t.numpy())
+
+
 
     return {
         'k_pred': np.array(k_pred),
         'g_pred': np.array(g_pred),
+
         'k_true': np.array(k_true),
         'g_true': np.array(g_true),
+
     }
 
 
@@ -1102,35 +973,36 @@ def visualize_predictions(predictions):
     Visualize prediction results.
 
     Args:
-        predictions: Output dictionary from predict()
+        predictions: Output returned by predict().
     """
+
+    _set_plot_font()
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+
 
     axs[0].scatter(predictions['k_true'], predictions['k_pred'], alpha=0.5)
     axs[0].set_xscale('log')
     axs[0].set_yscale('log')
-    axs[0].plot(
-        [min(predictions['k_true']), max(predictions['k_true'])],
-        [min(predictions['k_true']), max(predictions['k_true'])],
-        'r--'
-    )
+    axs[0].plot([min(predictions['k_true']), max(predictions['k_true'])],
+                [min(predictions['k_true']), max(predictions['k_true'])],
+                'r--')
     axs[0].set_xlabel('True k (N/m)')
     axs[0].set_ylabel('Predicted k (N/m)')
     axs[0].set_title('Elastic Constant (k)')
     axs[0].grid(True, which='both', ls='--', alpha=0.5)
 
+
     axs[1].scatter(predictions['g_true'], predictions['g_pred'], alpha=0.5)
     axs[1].set_xscale('log')
     axs[1].set_yscale('log')
-    axs[1].plot(
-        [min(predictions['g_true']), max(predictions['g_true'])],
-        [min(predictions['g_true']), max(predictions['g_true'])],
-        'r--'
-    )
-    axs[1].set_xlabel('True gamma (kg/s)')
-    axs[1].set_ylabel('Predicted gamma (kg/s)')
-    axs[1].set_title('Damping Coefficient (gamma)')
+    axs[1].plot([min(predictions['g_true']), max(predictions['g_true'])],
+                [min(predictions['g_true']), max(predictions['g_true'])],
+                'r--')
+    axs[1].set_xlabel('True γ (kg/s)')
+    axs[1].set_ylabel('Predicted γ (kg/s)')
+    axs[1].set_title('Damping Coefficient (γ)')
     axs[1].grid(True, which='both', ls='--', alpha=0.5)
+
 
     plt.tight_layout()
     plt.savefig('./checkpoints/prediction_results.png')
@@ -1138,8 +1010,12 @@ def visualize_predictions(predictions):
 
 
 if __name__ == "__main__":
+
     config = TrainingConfig()
+
+
     model = train_model(config)
+
 
     val_dataset = BrownianDataset(
         config.val_file,
@@ -1156,10 +1032,13 @@ if __name__ == "__main__":
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=4,
-        pin_memory=(config.device == 'cuda'),
+        pin_memory=(config.device == 'cuda')
     )
 
+
     predictions = predict(model, val_loader, config.device)
+
+
     visualize_predictions(predictions)
 
     print("Training and evaluation completed.")
