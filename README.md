@@ -97,7 +97,7 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### 1. Download the pretrained checkpoint
+### 1. Download the pretrained checkpoint **(Being optimized, will be released soon)**
 
 The pretrained ParamNet checkpoint is provided through the GitHub Release page.
 
@@ -107,7 +107,7 @@ The pretrained ParamNet checkpoint is provided through the GitHub Release page.
 After downloading `checkpoints.zip`, unzip it and place the checkpoint file as:
 
 ```bash
-checkpoints/best_model.pth
+checkpoints/best_model.pth (Under revision)
 ```
 
 The expected directory structure is:
@@ -117,7 +117,7 @@ ParamNet-for-Levitation/
 ├── ParamNet_training.py
 ├── ParamNet_running.ipynb
 ├── checkpoints/
-│   └── best_model.pth
+│   └── best_model.pth **(Being optimized, will be released soon)**
 └── requirements.txt
 ```
 
@@ -168,7 +168,7 @@ The current physics-guided training setup in the main script uses:
 
 These settings reflect the current implementation used to align the repository with the manuscript description.
 
-## Pretrained Checkpoint
+## Pretrained  **(Being optimized, will be released soon)**
 
 The pretrained checkpoint is available from the GitHub Release page:
 
@@ -187,7 +187,7 @@ The checkpoint can be loaded in Python as:
 ```python
 import torch
 
-checkpoint_path = "checkpoints/best_model.pth"
+checkpoint_path = "checkpoints/best_model.pth" 
 state_dict = torch.load(checkpoint_path, map_location="cpu")
 ```
 
